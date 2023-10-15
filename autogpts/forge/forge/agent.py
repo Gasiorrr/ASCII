@@ -1,194 +1,144 @@
-from colorama import Fore, Style
+from forge.sdk import (
+    Agent,
+    AgentDB,
+    ForgeLogger,
+    Step,
+    StepRequestBody,
+    Task,
+    TaskRequestBody,
+    Workspace,    
+    PromptEngine,	
+    chat_completion_request,	
+    ChromaMemStore	
+)
+import json	
+import pprint
 
-from autogpt.app import execute_command, get_command
-from autogpt.chat import chat_with_ai, create_chat_message
-from autogpt.config import Config
-from autogpt.json_utils.json_fix_llm import fix_json_using_multiple_techniques
-from autogpt.json_utils.utilities import validate_json
-from autogpt.logs import logger, print_assistant_thoughts
-from autogpt.speech import say_text
-from autogpt.spinner import Spinner
-from autogpt.utils import clean_input
+LOG = ForgeLogger(__name__)
 
 
-class Agent:
-    """Agent class for interacting with Auto-GPT.
-    Attributes:
-        ai_name: The name of the agent.
-        memory: The memory object to use.
-        full_message_history: The full message history.
-        next_action_count: The number of actions to execute.
-        system_prompt: The system prompt is the initial prompt that defines everything the AI needs to know to achieve its task successfully.
-        Currently, the dynamic and customizable information in the system prompt are ai_name, description and goals.
-        triggering_prompt: The last sentence the AI will see before answering. For Auto-GPT, this prompt is:
-            Determine which next command to use, and respond using the format specified above:
-            The triggering prompt is not part of the system prompt because between the system prompt and the triggering
-            prompt we have contextual information that can distract the AI and make it forget that its goal is to find the next task to achieve.
-            SYSTEM PROMPT
-            CONTEXTUAL INFORMATION (memory, previous conversations, anything relevant)
-            TRIGGERING PROMPT
-        The triggering prompt reminds the AI about its short term meta task (defining the next task)
+class ForgeAgent(Agent):
+    """
+    The goal of the Forge is to take care of the boilerplate code, so you can focus on
+    agent design.
+
+    There is a great paper surveying the agent landscape: https://arxiv.org/abs/2308.11432
+    Which I would highly recommend reading as it will help you understand the possabilities.
+
+    Here is a summary of the key components of an agent:
+
+    Anatomy of an agent:
+         - Profile
+         - Memory
+         - Planning
+         - Action
+
+    Profile:
+
+    Agents typically perform a task by assuming specific roles. For example, a teacher,
+    a coder, a planner etc. In using the profile in the llm prompt it has been shown to
+    improve the quality of the output. https://arxiv.org/abs/2305.14688
+
+    Additionally, based on the profile selected, the agent could be configured to use a
+    different llm. The possibilities are endless and the profile can be selected
+    dynamically based on the task at hand.
+
+    Memory:
+
+    Memory is critical for the agent to accumulate experiences, self-evolve, and behave
+    in a more consistent, reasonable, and effective manner. There are many approaches to
+    memory. However, some thoughts: there is long term and short term or working memory.
+    You may want different approaches for each. There has also been work exploring the
+    idea of memory reflection, which is the ability to assess its memories and re-evaluate
+    them. For example, condensing short term memories into long term memories.
+
+    Planning:
+
+    When humans face a complex task, they first break it down into simple subtasks and then
+    solve each subtask one by one. The planning module empowers LLM-based agents with the ability
+    to think and plan for solving complex tasks, which makes the agent more comprehensive,
+    powerful, and reliable. The two key methods to consider are: Planning with feedback and planning
+    without feedback.
+
+    Action:
+
+    Actions translate the agent's decisions into specific outcomes. For example, if the agent
+    decides to write a file, the action would be to write the file. There are many approaches you
+    could implement actions.
+
+    The Forge has a basic module for each of these areas. However, you are free to implement your own.
+    This is just a starting point.
     """
 
-    def __init__(
-        self,
-        ai_name,
-        memory,
-        full_message_history,
-        next_action_count,
-        system_prompt,
-        triggering_prompt,
-    ):
-        self.ai_name = ai_name
-        self.memory = memory
-        self.full_message_history = full_message_history
-        self.next_action_count = next_action_count
-        self.system_prompt = system_prompt
-        self.triggering_prompt = triggering_prompt
+    def __init__(self, database: AgentDB, workspace: Workspace):
+        """
+        The database is used to store tasks, steps and artifact metadata. The workspace is used to
+        store artifacts. The workspace is a directory on the file system.
 
-    def start_interaction_loop(self):
-        # Interaction Loop
-        cfg = Config()
-        loop_count = 0
-        command_name = None
-        arguments = None
-        user_input = ""
+        Feel free to create subclasses of the database and workspace to implement your own storage
+        """
+        super().__init__(database, workspace)
 
-        while True:
-            # Discontinue if continuous limit is reached
-            loop_count += 1
-            if (
-                cfg.continuous_mode
-                and cfg.continuous_limit > 0
-                and loop_count > cfg.continuous_limit
-            ):
-                logger.typewriter_log(
-                    "Continuous Limit Reached: ", Fore.YELLOW, f"{cfg.continuous_limit}"
-                )
-                break
+    async def create_task(self, task_request: TaskRequestBody) -> Task:
+        """
+        The agent protocol, which is the core of the Forge, works by creating a task and then
+        executing steps for that task. This method is called when the agent is asked to create
+        a task.
 
-            # Send message to AI, get response
-            with Spinner("Thinking... "):
-                assistant_reply = chat_with_ai(
-                    self.system_prompt,
-                    self.triggering_prompt,
-                    self.full_message_history,
-                    self.memory,
-                    cfg.fast_token_limit,
-                )  # TODO: This hardcodes the model to use GPT3.5. Make this an argument
+        We are hooking into function to add a custom log message. Though you can do anything you
+        want here.
+        """
+        task = await super().create_task(task_request)
+        LOG.info(
+            f"📦 Task created: {task.task_id} input: {task.input[:40]}{'...' if len(task.input) > 40 else ''}"
+        )
+        return task
 
-            assistant_reply_json = fix_json_using_multiple_techniques(assistant_reply)
+    async def execute_step(self, task_id: str, step_request: StepRequestBody) -> Step:
+        """
+        For a tutorial on how to add your own logic please see the offical tutorial series:
+        https://aiedge.medium.com/autogpt-forge-e3de53cc58ec
 
-            # Print Assistant thoughts
-            if assistant_reply_json != {}:
-                validate_json(assistant_reply_json, "llm_response_format_1")
-                # Get command name and arguments
-                try:
-                    print_assistant_thoughts(self.ai_name, assistant_reply_json)
-                    command_name, arguments = get_command(assistant_reply_json)
-                    # command_name, arguments = assistant_reply_json_valid["command"]["name"], assistant_reply_json_valid["command"]["args"]
-                    if cfg.speak_mode:
-                        say_text(f"I want to execute {command_name}")
-                except Exception as e:
-                    logger.error("Error: \n", str(e))
+        The agent protocol, which is the core of the Forge, works by creating a task and then
+        executing steps for that task. This method is called when the agent is asked to execute
+        a step.
 
-            if not cfg.continuous_mode and self.next_action_count == 0:
-                ### GET USER AUTHORIZATION TO EXECUTE COMMAND ###
-                # Get key press: Prompt the user to press enter to continue or escape
-                # to exit
-                logger.typewriter_log(
-                    "NEXT ACTION: ",
-                    Fore.CYAN,
-                    f"COMMAND = {Fore.CYAN}{command_name}{Style.RESET_ALL}  "
-                    f"ARGUMENTS = {Fore.CYAN}{arguments}{Style.RESET_ALL}",
-                )
-                print(
-                    "Enter 'y' to authorise command, 'y -N' to run N continuous "
-                    "commands, 'n' to exit program, or enter feedback for "
-                    f"{self.ai_name}...",
-                    flush=True,
-                )
-                while True:
-                    console_input = clean_input(
-                        Fore.MAGENTA + "Input:" + Style.RESET_ALL
-                    )
-                    if console_input.lower().strip() == "y":
-                        user_input = "GENERATE NEXT COMMAND JSON"
-                        break
-                    elif console_input.lower().strip() == "":
-                        print("Invalid input format.")
-                        continue
-                    elif console_input.lower().startswith("y -"):
-                        try:
-                            self.next_action_count = abs(
-                                int(console_input.split(" ")[1])
-                            )
-                            user_input = "GENERATE NEXT COMMAND JSON"
-                        except ValueError:
-                            print(
-                                "Invalid input format. Please enter 'y -n' where n is"
-                                " the number of continuous tasks."
-                            )
-                            continue
-                        break
-                    elif console_input.lower() == "n":
-                        user_input = "EXIT"
-                        break
-                    else:
-                        user_input = console_input
-                        command_name = "human_feedback"
-                        break
+        The task that is created contains an input string, for the benchmarks this is the task
+        the agent has been asked to solve and additional input, which is a dictionary and
+        could contain anything.
 
-                if user_input == "GENERATE NEXT COMMAND JSON":
-                    logger.typewriter_log(
-                        "-=-=-=-=-=-=-= COMMAND AUTHORISED BY USER -=-=-=-=-=-=-=",
-                        Fore.MAGENTA,
-                        "",
-                    )
-                elif user_input == "EXIT":
-                    print("Exiting...", flush=True)
-                    break
-            else:
-                # Print command
-                logger.typewriter_log(
-                    "NEXT ACTION: ",
-                    Fore.CYAN,
-                    f"COMMAND = {Fore.CYAN}{command_name}{Style.RESET_ALL}"
-                    f"  ARGUMENTS = {Fore.CYAN}{arguments}{Style.RESET_ALL}",
-                )
+        If you want to get the task use:
 
-            # Execute command
-            if command_name is not None and command_name.lower().startswith("error"):
-                result = (
-                    f"Command {command_name} threw the following error: {arguments}"
-                )
-            elif command_name == "human_feedback":
-                result = f"Human feedback: {user_input}"
-            else:
-                result = (
-                    f"Command {command_name} returned: "
-                    f"{execute_command(command_name, arguments)}"
-                )
-                if self.next_action_count > 0:
-                    self.next_action_count -= 1
+        ```
+        task = await self.db.get_task(task_id)
+        ```
 
-            memory_to_add = (
-                f"Assistant Reply: {assistant_reply} "
-                f"\nResult: {result} "
-                f"\nHuman Feedback: {user_input} "
-            )
+        The step request body is essentially the same as the task request and contains an input
+        string, for the benchmarks this is the task the agent has been asked to solve and
+        additional input, which is a dictionary and could contain anything.
 
-            self.memory.add(memory_to_add)
+        You need to implement logic that will take in this step input and output the completed step
+        as a step object. You can do everything in a single step or you can break it down into
+        multiple steps. Returning a request to continue in the step output, the user can then decide
+        if they want the agent to continue or not.
+        """
+        # An example that
+        step = await self.db.create_step(
+            task_id=task_id, input=step_request, is_last=True
+        )
 
-            # Check if there's a result from the command append it to the message
-            # history
-            if result is not None:
-                self.full_message_history.append(create_chat_message("system", result))
-                logger.typewriter_log("SYSTEM: ", Fore.YELLOW, result)
-            else:
-                self.full_message_history.append(
-                    create_chat_message("system", "Unable to execute command")
-                )
-                logger.typewriter_log(
-                    "SYSTEM: ", Fore.YELLOW, "Unable to execute command"
-                )
+        self.workspace.write(task_id=task_id, path="output.txt", data=b"Washington D.C")
+
+        await self.db.create_artifact(
+            task_id=task_id,
+            step_id=step.step_id,
+            file_name="output.txt",
+            relative_path="",
+            agent_created=True,
+        )
+
+        step.output = "Washington D.C"
+
+        LOG.info(f"\t✅ Final Step completed: {step.step_id}")
+
+        return step
